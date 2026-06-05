@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "apple-contacts": {
+      "title": "Apple Contacts",
+      "description": "Local macOS Contacts MCP server with dry-run defaults and explicit write confirmations.",
+      "cwd": ".",
+      "command": "node",
+      "args": [
+        "./bin/apple-contacts-mcp.cjs"
+      ]
+    }
+  }
+}
+

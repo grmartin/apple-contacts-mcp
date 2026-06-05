@@ -1,0 +1,28 @@
+{
+  "name": "apple-contacts-mcp",
+  "version": "0.2.0",
+  "description": "Local-first MCP server for safely searching, editing, and maintaining Apple Contacts notes on macOS.",
+  "type": "commonjs",
+  "bin": {
+    "apple-contacts-mcp": "./bin/apple-contacts-mcp.cjs"
+  },
+  "scripts": {
+    "start": "node ./bin/apple-contacts-mcp.cjs",
+    "test": "node --test tests/*.test.mjs",
+    "smoke": "node ./scripts/smoke-test.mjs",
+    "smoke:live": "APPLE_CONTACTS_MCP_LIVE_TEST=1 node ./scripts/smoke-test.mjs"
+  },
+  "keywords": [
+    "mcp",
+    "apple-contacts",
+    "contacts",
+    "macos",
+    "codex",
+    "claude"
+  ],
+  "author": "Apple Contacts MCP contributors",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  }
+}

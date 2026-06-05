@@ -1,0 +1,35 @@
+{
+  "name": "apple-contacts-mcp",
+  "version": "0.2.0",
+  "description": "Local-first MCP server for safely searching, editing, and maintaining Apple Contacts notes on macOS.",
+  "author": {
+    "name": "Apple Contacts MCP contributors"
+  },
+  "license": "MIT",
+  "keywords": [
+    "mcp",
+    "contacts",
+    "macos",
+    "apple-contacts",
+    "local-first"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Apple Contacts MCP",
+    "shortDescription": "Safely search, edit, and note macOS Contacts locally.",
+    "longDescription": "Apple Contacts MCP exposes a local Model Context Protocol server for searching, creating, updating, deleting, and appending dated interaction notes to Apple Contacts through Contacts.app automation. Writes are dry-run by default and require explicit confirmation.",
+    "developerName": "Apple Contacts MCP contributors",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Find a contact in Apple Contacts",
+      "Create a contact draft for review",
+      "Append an interaction note to a contact"
+    ],
+    "brandColor": "#0A84FF"
+  }
+}
