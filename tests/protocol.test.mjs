@@ -52,6 +52,24 @@ test("parses contact rows and redacts values by default", () => {
   assert.equal(rows[0].note, "Existing note");
 });
 
+test("search_contacts script uses native Contacts predicates", () => {
+  const script = server.searchContactsScript("Ada", 10).join("\n");
+  assert.match(script, /people whose name contains queryText/);
+  assert.match(script, /people whose value of emails contains queryText/);
+  assert.match(script, /people whose value of phones contains queryText/);
+  assert.match(script, /seenIds/);
+  assert.doesNotMatch(script, /repeat with p in people/);
+});
+
+test("AppleScript timeout errors are explicit", () => {
+  const detail = server.appleScriptErrorDetail(
+    { killed: true, signal: "SIGTERM", message: "Command failed: osascript" },
+    "",
+    20000,
+  );
+  assert.match(detail, /osascript timed out after 20000ms/);
+});
+
 test("formats contact log entries", () => {
   const entry = server.formatContactLogEntry({
     date: "2026-06-04",

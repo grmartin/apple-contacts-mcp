@@ -195,6 +195,12 @@ function commonHandlers() {
   ];
 }
 
+function appleScriptErrorDetail(error, stderr, timeoutMs) {
+  const timedOut = error && (error.killed || error.signal === "SIGTERM" || error.code === "ETIMEDOUT");
+  const timeoutText = timedOut ? `osascript timed out after ${timeoutMs}ms` : "";
+  return [timeoutText, stderr && stderr.trim(), error && error.message].filter(Boolean).join(" ");
+}
+
 function runAppleScript(lines, { timeoutMs = 20000 } = {}) {
   return new Promise((resolve, reject) => {
     const args = [];
@@ -205,7 +211,7 @@ function runAppleScript(lines, { timeoutMs = 20000 } = {}) {
       { timeout: timeoutMs, maxBuffer: 1024 * 1024 },
       (error, stdout, stderr) => {
         if (error) {
-          const detail = [stderr && stderr.trim(), error.message].filter(Boolean).join(" ");
+          const detail = appleScriptErrorDetail(error, stderr, timeoutMs);
           reject(new Error(detail || "osascript failed"));
           return;
         }
@@ -288,6 +294,38 @@ function contactRowScriptForPerson(personRef = "p") {
   ];
 }
 
+function searchContactsScript(query, limit) {
+  return [
+    ...commonHandlers(),
+    `set queryText to ${appleString(query)}`,
+    `set maxResults to ${limit}`,
+    "tell application \"Contacts\"",
+    "  set rows to {}",
+    "  set seenIds to {}",
+    "  set candidateLists to {}",
+    "  set end of candidateLists to (people whose name contains queryText)",
+    "  set end of candidateLists to (people whose first name contains queryText)",
+    "  set end of candidateLists to (people whose last name contains queryText)",
+    "  set end of candidateLists to (people whose organization contains queryText)",
+    "  set end of candidateLists to (people whose job title contains queryText)",
+    "  set end of candidateLists to (people whose value of emails contains queryText)",
+    "  set end of candidateLists to (people whose value of phones contains queryText)",
+    "  repeat with candidateList in candidateLists",
+    "    repeat with p in candidateList",
+    "      set contactId to (id of p as text)",
+    "      if seenIds does not contain contactId then",
+    "        set end of seenIds to contactId",
+    ...contactRowScriptForPerson("p").map((line) => `        ${line}`),
+    "        set end of rows to outputRow",
+    "        if (count of rows) is greater than or equal to maxResults then return my joinList(rows, linefeed)",
+    "      end if",
+    "    end repeat",
+    "  end repeat",
+    "  return my joinList(rows, linefeed)",
+    "end tell",
+  ];
+}
+
 async function contactsStatus() {
   const script = [
     ...commonHandlers(),
@@ -322,33 +360,7 @@ async function searchContacts(args) {
   const includePhones = boolValue(args, "includePhones", false);
   const includeNote = boolValue(args, "includeNote", false);
   const revealValues = boolValue(args, "revealValues", false);
-  const script = [
-    ...commonHandlers(),
-    `set queryText to ${appleString(query)}`,
-    `set maxResults to ${limit}`,
-    "tell application \"Contacts\"",
-    "  set rows to {}",
-    "  repeat with p in people",
-    "    set searchableText to (my scrub(name of p) & \" \" & my scrub(first name of p) & \" \" & my scrub(last name of p) & \" \" & my scrub(organization of p) & \" \" & my scrub(job title of p))",
-    "    repeat with e in emails of p",
-    "      set searchableText to searchableText & \" \" & my scrub(value of e)",
-    "    end repeat",
-    "    repeat with ph in phones of p",
-    "      set searchableText to searchableText & \" \" & my scrub(value of ph)",
-    "    end repeat",
-    "    set matched to false",
-    "    ignoring case",
-    "      if searchableText contains queryText then set matched to true",
-    "    end ignoring",
-    "    if matched then",
-    ...contactRowScriptForPerson("p").map((line) => `      ${line}`),
-    "      set end of rows to outputRow",
-    "      if (count of rows) is greater than or equal to maxResults then exit repeat",
-    "    end if",
-    "  end repeat",
-    "  return my joinList(rows, linefeed)",
-    "end tell",
-  ];
+  const script = searchContactsScript(query, limit);
   const output = await runAppleScript(script);
   const contacts = parseContactRows(output, { includeEmails, includePhones, includeNote, revealValues });
   return {
@@ -918,6 +930,8 @@ module.exports = {
   formatContactLogEntry,
   handleRpc,
   parseContactRows,
+  searchContactsScript,
+  appleScriptErrorDetail,
   maskEmail,
   maskPhone,
 };
