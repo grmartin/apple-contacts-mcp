@@ -11,6 +11,8 @@ Recommended agent policy:
 - Call `contacts_status` first.
 - Search narrowly.
 - Prefer redacted results unless exact email/phone values are needed.
+- Only pass the `includeX` flags on `search_contacts` you actually need (e.g. `includeRelatedNames`, `includeAddresses`, `includeBirthday`) — each one adds AppleScript work per result, and the defaults are tuned to keep a plain name search fast.
+- Instant messages are read-only; don't attempt to create or update them.
 - Treat returned contact data as personal data.
 - Never write on the first pass. Use dry-run output as the user-facing diff.
 - Apply writes only after explicit user approval.

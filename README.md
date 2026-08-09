@@ -7,12 +7,30 @@ The server uses `Contacts.app` automation through AppleScript today. That keeps 
 ## Tools
 
 - `contacts_status`: check Contacts.app access and return aggregate counts.
-- `search_contacts`: search local contacts by name, organization, job title, email, or phone.
-- `create_contact`: create a contact. Dry-run by default.
-- `update_contact`: update scalar fields, notes, or add email/phone values. Dry-run by default.
+- `search_contacts`: search local contacts by name, organization, job title, email, or phone. Optional field groups (emails, phones, note, extendedName, orgDetails, birthday, addresses, urls, relatedNames, socialProfiles, instantMessages, customDates) are only fetched when their `includeX` flag is set, so a default search stays fast.
+- `create_contact`: create a contact, including name/title/phonetic fields, organization, birthday, note, emails, phones, addresses, urls, related names ("relatives"), social profiles, and custom dates. Dry-run by default.
+- `update_contact`: update any scalar field or append new emails, phones, addresses, urls, related names, social profiles, or custom dates. Dry-run by default.
 - `append_contact_note`: append a dated interaction log entry to a contact note. Dry-run by default.
 - `delete_contact`: delete a contact. Dry-run by default and requires a confirmation phrase.
 - `test_roundtrip`: create, edit, verify, and delete one dummy contact.
+
+## Field Coverage
+
+Almost every field Contacts.app exposes over AppleScript is supported for read and write:
+
+- **Name**: firstName, middleName, lastName, title, suffix, nickname, maidenName, phoneticFirstName/MiddleName/LastName
+- **Org**: organization, department, jobTitle, isCompany
+- **Dates**: birthday (`YYYY-MM-DD`, or `--MM-DD` for no year), custom dates (e.g. Anniversary)
+- **Contact methods**: emails, phones, urls
+- **Addresses**: label, street, city, state, zip, country, countryCode
+- **Related names**: Apple's "relatives" field — label (spouse, parent, child, ...) plus a name
+- **Social profiles**: service, userName, url
+- **Note**: free text, with `append_contact_note` for dated logs
+
+Two exclusions:
+
+- **Photos** are not read or written. Even checking whether a contact *has* a photo via AppleScript (`image of person`) forces Contacts.app to transfer the full image over Apple Events — roughly 1-2 seconds per contact — so it's left out entirely to keep searches fast.
+- **Instant messages** are read-only. `search_contacts` can return them, but `make new instant message` reliably fails under Contacts.app AppleScript automation on current macOS (a platform limitation, not a bug in this server), so `create_contact`/`update_contact` reject any instant-message input with a clear error.
 
 ## Requirements
 

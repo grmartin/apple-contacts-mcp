@@ -16,6 +16,9 @@ Safety rules:
 - Do not update or delete a real contact unless the user has approved the exact contact and the exact diff.
 - Create/update/append-note/delete tools are dry-run by default. Actual writes require `dryRun: false` and `confirm: true`.
 - Avoid returning phone numbers and email addresses unless the user needs those exact fields.
+- `search_contacts` only fetches optional field groups (addresses, urls, relatedNames, socialProfiles, instantMessages, customDates, extendedName, orgDetails, birthday) when their `includeX` flag is set — pass only the flags you need to keep searches fast.
+- "Relatives" live in the `relatedNames` field (label like spouse/parent/child plus a name); use `includeRelatedNames` to read them and `relatedNames`/`addRelatedNames` to write them.
+- Instant messages are read-only (a Contacts.app AppleScript limitation) — `create_contact`/`update_contact` will reject instant-message input.
 - Mention that edits may sync to iCloud, Google, Exchange, or any configured Contacts account.
 - Never edit the SQLite AddressBook database directly.
 

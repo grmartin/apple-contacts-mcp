@@ -5,9 +5,7 @@ const childProcess = require("node:child_process");
 const readline = require("node:readline");
 
 const SERVER_NAME = "apple-contacts-mcp";
-const SERVER_VERSION = "0.2.0";
-const FIELD_SEPARATOR = "\t";
-const LIST_SEPARATOR = ",";
+const SERVER_VERSION = "0.3.0";
 const MAX_SEARCH_LIMIT = 25;
 
 const SERVER_INSTRUCTIONS = [
@@ -21,6 +19,8 @@ const SERVER_INSTRUCTIONS = [
   "Delete also requires confirmPhrase=\"delete contact\".",
   "Avoid returning email and phone values unless the user needs exact fields.",
   "Local writes may sync to iCloud, Google, Exchange, or other configured Contacts accounts.",
+  "search_contacts only fetches optional field groups (addresses, urls, relatedNames, socialProfiles, instantMessages, customDates, extendedName, orgDetails, birthday) when their includeX flag is set, to keep default searches fast.",
+  "Instant messages are read-only: Contacts.app AppleScript automation cannot create or edit them (a macOS limitation).",
 ].join(" ");
 
 function isPlainObject(value) {
@@ -147,6 +147,115 @@ function normalizeLabeledValues(values, kind) {
   });
 }
 
+function normalizeAddresses(values) {
+  if (values == null) return [];
+  if (!Array.isArray(values)) throw new Error("addresses must be an array");
+  return values.slice(0, 10).map((item) => {
+    if (!isPlainObject(item)) throw new Error("addresses entries must be objects");
+    const address = {
+      label: normalizeLabel(item.label, "home"),
+      street: optionalString(item, "street", 500) || "",
+      city: optionalString(item, "city", 200) || "",
+      state: optionalString(item, "state", 200) || "",
+      zip: optionalString(item, "zip", 40) || "",
+      country: optionalString(item, "country", 200) || "",
+      countryCode: optionalString(item, "countryCode", 10) || "",
+    };
+    if (!address.street && !address.city && !address.state && !address.zip && !address.country) {
+      throw new Error("addresses entries need at least one of street, city, state, zip, or country");
+    }
+    return address;
+  });
+}
+
+function normalizeUrls(values) {
+  if (values == null) return [];
+  if (!Array.isArray(values)) throw new Error("urls must be an array");
+  return values.slice(0, 10).map((item) => {
+    if (typeof item === "string") {
+      const value = scrubInput(item, 2000);
+      if (!value) throw new Error("urls entries require a value");
+      return { label: "home page", value };
+    }
+    if (!isPlainObject(item)) throw new Error("urls entries must be objects or strings");
+    const value = scrubInput(item.value, 2000);
+    if (!value) throw new Error("urls entries require a value");
+    return { label: normalizeLabel(item.label, "home page"), value };
+  });
+}
+
+function normalizeRelatedNames(values) {
+  if (values == null) return [];
+  if (!Array.isArray(values)) throw new Error("relatedNames must be an array");
+  return values.slice(0, 10).map((item) => {
+    if (!isPlainObject(item)) throw new Error("relatedNames entries must be objects");
+    const label = scrubInput(item.label, 40);
+    const value = scrubInput(item.value, 200);
+    if (!label) throw new Error("relatedNames entries require a label (e.g. spouse, parent, child)");
+    if (!value) throw new Error("relatedNames entries require a value (the related person's name)");
+    return { label, value };
+  });
+}
+
+function normalizeSocialProfiles(values) {
+  if (values == null) return [];
+  if (!Array.isArray(values)) throw new Error("socialProfiles must be an array");
+  return values.slice(0, 10).map((item) => {
+    if (!isPlainObject(item)) throw new Error("socialProfiles entries must be objects");
+    const service = scrubInput(item.service, 100);
+    const userName = scrubInput(item.userName, 200);
+    const url = scrubInput(item.url, 2000);
+    if (!service) throw new Error("socialProfiles entries require a service name");
+    if (!userName && !url) throw new Error("socialProfiles entries require userName or url");
+    return { service, userName, url };
+  });
+}
+
+function normalizeDateParts(value) {
+  const raw = scrubInput(value, 20);
+  let match = /^--(\d{2})-(\d{2})$/.exec(raw);
+  if (match) {
+    const month = Number(match[1]);
+    const day = Number(match[2]);
+    if (month < 1 || month > 12 || day < 1 || day > 31) throw new Error(`invalid date: ${raw}`);
+    return { year: 1604, month, day };
+  }
+  match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(raw);
+  if (match) {
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    if (month < 1 || month > 12 || day < 1 || day > 31) throw new Error(`invalid date: ${raw}`);
+    return { year, month, day };
+  }
+  throw new Error(`date must use YYYY-MM-DD or --MM-DD (no year), got: ${raw || "(empty)"}`);
+}
+
+function formatDatePartsIso({ year, month, day }) {
+  const mm = String(month).padStart(2, "0");
+  const dd = String(day).padStart(2, "0");
+  if (year === 1604) return `--${mm}-${dd}`;
+  return `${year}-${mm}-${dd}`;
+}
+
+function normalizeCustomDates(values) {
+  if (values == null) return [];
+  if (!Array.isArray(values)) throw new Error("customDates must be an array");
+  return values.slice(0, 10).map((item) => {
+    if (!isPlainObject(item)) throw new Error("customDates entries must be objects");
+    const label = scrubInput(item.label, 40);
+    if (!label) throw new Error("customDates entries require a label (e.g. Anniversary)");
+    return { label, ...normalizeDateParts(item.value) };
+  });
+}
+
+function rejectInstantMessages(value) {
+  if (value == null) return;
+  throw new Error(
+    "instant messages are read-only: Contacts.app AppleScript automation cannot create or update them (a macOS limitation)",
+  );
+}
+
 function maskEmail(value) {
   const email = String(value || "");
   const at = email.indexOf("@");
@@ -192,6 +301,78 @@ function commonHandlers() {
     "  set AppleScript's text item delimiters to oldDelims",
     "  return output",
     "end joinList",
+    "",
+    "on replaceText(s, findText, replaceTextV)",
+    "  set oldDelims to AppleScript's text item delimiters",
+    "  set AppleScript's text item delimiters to findText",
+    "  set parts to text items of s",
+    "  set AppleScript's text item delimiters to replaceTextV",
+    "  set outputText to parts as text",
+    "  set AppleScript's text item delimiters to oldDelims",
+    "  return outputText",
+    "end replaceText",
+    "",
+    "on jsonEsc(v)",
+    "  try",
+    "    if v is missing value then return \"\"",
+    "    set s to v as text",
+    "  on error",
+    "    return \"\"",
+    "  end try",
+    "  set s to my replaceText(s, \"\\\\\", \"\\\\\\\\\")",
+    "  set s to my replaceText(s, \"\\\"\", \"\\\\\\\"\")",
+    "  set s to my replaceText(s, tab, \"\\\\t\")",
+    "  set s to my replaceText(s, linefeed, \"\\\\n\")",
+    "  set s to my replaceText(s, return, \"\\\\r\")",
+    "  return s",
+    "end jsonEsc",
+    "",
+    "on jsonStr(v)",
+    "  return \"\\\"\" & my jsonEsc(v) & \"\\\"\"",
+    "end jsonStr",
+    "",
+    "on jsonBool(v)",
+    "  if v is true then",
+    "    return \"true\"",
+    "  else",
+    "    return \"false\"",
+    "  end if",
+    "end jsonBool",
+    "",
+    "on jsonPair(k, v)",
+    "  return (\"\\\"\" & k & \"\\\":\" & v)",
+    "end jsonPair",
+    "",
+    "on jsonObj(pairs)",
+    "  return (\"{\" & my joinList(pairs, \",\") & \"}\")",
+    "end jsonObj",
+    "",
+    "on jsonArr(itemList)",
+    "  return (\"[\" & my joinList(itemList, \",\") & \"]\")",
+    "end jsonArr",
+    "",
+    "on isoDate(d)",
+    "  if d is missing value then return \"null\"",
+    "  set y to year of d",
+    "  set m to (month of d) as integer",
+    "  set dy to day of d",
+    "  set mm to text -2 thru -1 of (\"0\" & m)",
+    "  set dd to text -2 thru -1 of (\"0\" & dy)",
+    "  if y is 1604 then",
+    "    return my jsonStr(\"--\" & mm & \"-\" & dd)",
+    "  else",
+    "    return my jsonStr((y as text) & \"-\" & mm & \"-\" & dd)",
+    "  end if",
+    "end isoDate",
+    "",
+    "on buildDate(y, m, d)",
+    "  set dt to current date",
+    "  set year of dt to y",
+    "  set month of dt to m",
+    "  set day of dt to d",
+    "  set time of dt to 0",
+    "  return dt",
+    "end buildDate",
   ];
 }
 
@@ -208,7 +389,7 @@ function runAppleScript(lines, { timeoutMs = 20000 } = {}) {
     childProcess.execFile(
       "osascript",
       args,
-      { timeout: timeoutMs, maxBuffer: 1024 * 1024 },
+      { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 },
       (error, stdout, stderr) => {
         if (error) {
           const detail = appleScriptErrorDetail(error, stderr, timeoutMs);
@@ -221,80 +402,202 @@ function runAppleScript(lines, { timeoutMs = 20000 } = {}) {
   });
 }
 
-function parsePairList(value) {
-  if (!value) return [];
-  return String(value)
-    .split(LIST_SEPARATOR)
-    .map((item) => item.trim())
-    .filter(Boolean)
-    .map((item) => {
-      const equals = item.indexOf("=");
-      if (equals === -1) return { label: "", value: item };
-      return { label: item.slice(0, equals), value: item.slice(equals + 1) };
-    });
+// Optional field groups for search_contacts. Only requested groups are computed by
+// AppleScript, so a default search stays as fast as it was before these fields existed.
+// Counts (emailCount, addressCount, ...) are always computed since `count of X` is cheap.
+const ALL_GROUPS = {
+  emails: true,
+  phones: true,
+  note: true,
+  extendedName: true,
+  orgDetails: true,
+  birthday: true,
+  addresses: true,
+  urls: true,
+  relatedNames: true,
+  socialProfiles: true,
+  instantMessages: true,
+  customDates: true,
+};
+
+function resolveGroups(args) {
+  return {
+    emails: boolValue(args, "includeEmails", false),
+    phones: boolValue(args, "includePhones", false),
+    note: boolValue(args, "includeNote", false),
+    extendedName: boolValue(args, "includeExtendedName", false),
+    orgDetails: boolValue(args, "includeOrgDetails", false),
+    birthday: boolValue(args, "includeBirthday", false),
+    addresses: boolValue(args, "includeAddresses", false),
+    urls: boolValue(args, "includeUrls", false),
+    relatedNames: boolValue(args, "includeRelatedNames", false),
+    socialProfiles: boolValue(args, "includeSocialProfiles", false),
+    instantMessages: boolValue(args, "includeInstantMessages", false),
+    customDates: boolValue(args, "includeCustomDates", false),
+  };
 }
 
-function parseContactRows(
-  text,
-  { includeEmails = false, includePhones = false, includeNote = false, revealValues = false } = {},
-) {
+function contactJsonScriptForPerson(personRef = "p", groups = {}) {
+  const lines = [];
+  const pairs = [
+    `my jsonPair("id", my jsonStr(id of ${personRef} as text))`,
+    `my jsonPair("name", my jsonStr(name of ${personRef}))`,
+    `my jsonPair("firstName", my jsonStr(first name of ${personRef}))`,
+    `my jsonPair("lastName", my jsonStr(last name of ${personRef}))`,
+    `my jsonPair("organization", my jsonStr(organization of ${personRef}))`,
+    `my jsonPair("jobTitle", my jsonStr(job title of ${personRef}))`,
+  ];
+
+  lines.push(
+    `set emailCountVal to (count of emails of ${personRef})`,
+    `set phoneCountVal to (count of phones of ${personRef})`,
+    `set addressCountVal to (count of addresses of ${personRef})`,
+    `set urlCountVal to (count of urls of ${personRef})`,
+    `set relatedNameCountVal to (count of related names of ${personRef})`,
+    `set socialProfileCountVal to (count of social profiles of ${personRef})`,
+    `set instantMessageCountVal to (count of instant messages of ${personRef})`,
+    `set customDateCountVal to (count of custom dates of ${personRef})`,
+  );
+  pairs.push(
+    `my jsonPair("emailCount", emailCountVal as text)`,
+    `my jsonPair("phoneCount", phoneCountVal as text)`,
+    `my jsonPair("addressCount", addressCountVal as text)`,
+    `my jsonPair("urlCount", urlCountVal as text)`,
+    `my jsonPair("relatedNameCount", relatedNameCountVal as text)`,
+    `my jsonPair("socialProfileCount", socialProfileCountVal as text)`,
+    `my jsonPair("instantMessageCount", instantMessageCountVal as text)`,
+    `my jsonPair("customDateCount", customDateCountVal as text)`,
+  );
+
+  if (groups.emails) {
+    lines.push(
+      `set emailItems to {}`,
+      `repeat with e in emails of ${personRef}`,
+      `  set end of emailItems to my jsonObj({my jsonPair("label", my jsonStr(label of e)), my jsonPair("value", my jsonStr(value of e))})`,
+      `end repeat`,
+    );
+    pairs.push(`my jsonPair("emails", my jsonArr(emailItems))`);
+  }
+  if (groups.phones) {
+    lines.push(
+      `set phoneItems to {}`,
+      `repeat with ph in phones of ${personRef}`,
+      `  set end of phoneItems to my jsonObj({my jsonPair("label", my jsonStr(label of ph)), my jsonPair("value", my jsonStr(value of ph))})`,
+      `end repeat`,
+    );
+    pairs.push(`my jsonPair("phones", my jsonArr(phoneItems))`);
+  }
+  if (groups.note) {
+    pairs.push(`my jsonPair("note", my jsonStr(note of ${personRef}))`);
+  }
+  if (groups.extendedName) {
+    pairs.push(
+      `my jsonPair("title", my jsonStr(title of ${personRef}))`,
+      `my jsonPair("middleName", my jsonStr(middle name of ${personRef}))`,
+      `my jsonPair("suffix", my jsonStr(suffix of ${personRef}))`,
+      `my jsonPair("nickname", my jsonStr(nickname of ${personRef}))`,
+      `my jsonPair("maidenName", my jsonStr(maiden name of ${personRef}))`,
+      `my jsonPair("phoneticFirstName", my jsonStr(phonetic first name of ${personRef}))`,
+      `my jsonPair("phoneticMiddleName", my jsonStr(phonetic middle name of ${personRef}))`,
+      `my jsonPair("phoneticLastName", my jsonStr(phonetic last name of ${personRef}))`,
+    );
+  }
+  if (groups.orgDetails) {
+    pairs.push(
+      `my jsonPair("department", my jsonStr(department of ${personRef}))`,
+      `my jsonPair("isCompany", my jsonBool(company of ${personRef}))`,
+    );
+  }
+  if (groups.birthday) {
+    pairs.push(`my jsonPair("birthday", my isoDate(birth date of ${personRef}))`);
+  }
+  if (groups.addresses) {
+    lines.push(
+      `set addressItems to {}`,
+      `repeat with a in addresses of ${personRef}`,
+      `  set end of addressItems to my jsonObj({my jsonPair("label", my jsonStr(label of a)), my jsonPair("street", my jsonStr(street of a)), my jsonPair("city", my jsonStr(city of a)), my jsonPair("state", my jsonStr(state of a)), my jsonPair("zip", my jsonStr(zip of a)), my jsonPair("country", my jsonStr(country of a)), my jsonPair("countryCode", my jsonStr(country code of a))})`,
+      `end repeat`,
+    );
+    pairs.push(`my jsonPair("addresses", my jsonArr(addressItems))`);
+  }
+  if (groups.urls) {
+    lines.push(
+      `set urlItems to {}`,
+      `repeat with u in urls of ${personRef}`,
+      `  set end of urlItems to my jsonObj({my jsonPair("label", my jsonStr(label of u)), my jsonPair("value", my jsonStr(value of u))})`,
+      `end repeat`,
+    );
+    pairs.push(`my jsonPair("urls", my jsonArr(urlItems))`);
+  }
+  if (groups.relatedNames) {
+    lines.push(
+      `set relatedNameItems to {}`,
+      `repeat with rn in related names of ${personRef}`,
+      `  set end of relatedNameItems to my jsonObj({my jsonPair("label", my jsonStr(label of rn)), my jsonPair("value", my jsonStr(value of rn))})`,
+      `end repeat`,
+    );
+    pairs.push(`my jsonPair("relatedNames", my jsonArr(relatedNameItems))`);
+  }
+  if (groups.socialProfiles) {
+    lines.push(
+      `set socialProfileItems to {}`,
+      `repeat with sp in social profiles of ${personRef}`,
+      `  set end of socialProfileItems to my jsonObj({my jsonPair("service", my jsonStr(service name of sp)), my jsonPair("userName", my jsonStr(user name of sp)), my jsonPair("url", my jsonStr(url of sp))})`,
+      `end repeat`,
+    );
+    pairs.push(`my jsonPair("socialProfiles", my jsonArr(socialProfileItems))`);
+  }
+  if (groups.instantMessages) {
+    lines.push(
+      `set instantMessageItems to {}`,
+      `repeat with im in instant messages of ${personRef}`,
+      `  set end of instantMessageItems to my jsonObj({my jsonPair("label", my jsonStr(label of im)), my jsonPair("service", my jsonStr(service name of im)), my jsonPair("userName", my jsonStr(user name of im))})`,
+      `end repeat`,
+    );
+    pairs.push(`my jsonPair("instantMessages", my jsonArr(instantMessageItems))`);
+  }
+  if (groups.customDates) {
+    lines.push(
+      `set customDateItems to {}`,
+      `repeat with cd in custom dates of ${personRef}`,
+      `  set end of customDateItems to my jsonObj({my jsonPair("label", my jsonStr(label of cd)), my jsonPair("value", my isoDate(value of cd))})`,
+      `end repeat`,
+    );
+    pairs.push(`my jsonPair("customDates", my jsonArr(customDateItems))`);
+  }
+
+  lines.push(`set outputRow to my jsonObj({${pairs.join(", ")}})`);
+  return lines;
+}
+
+function parseContactRows(text, { revealValues = false } = {}) {
   if (!text) return [];
   return text
     .split(/\r?\n/u)
     .map((line) => line.trim())
     .filter(Boolean)
     .map((line) => {
-      const [id, name, firstName, lastName, organization, jobTitle, emailsText, phonesText, noteText] =
-        line.split(FIELD_SEPARATOR);
-      const emails = parsePairList(emailsText);
-      const phones = parsePairList(phonesText);
-      const contact = {
-        id,
-        name,
-        firstName,
-        lastName,
-        organization,
-        jobTitle,
-        emailCount: emails.length,
-        phoneCount: phones.length,
-      };
-      if (includeEmails) {
-        contact.emails = emails.map((item) => ({
+      const contact = JSON.parse(line);
+      if (Array.isArray(contact.emails)) {
+        contact.emails = contact.emails.map((item) => ({
           label: item.label,
           value: revealValues ? item.value : maskEmail(item.value),
         }));
       }
-      if (includePhones) {
-        contact.phones = phones.map((item) => ({
+      if (Array.isArray(contact.phones)) {
+        contact.phones = contact.phones.map((item) => ({
           label: item.label,
           value: revealValues ? item.value : maskPhone(item.value),
         }));
       }
-      if (includeNote) {
-        contact.note = noteText || "";
+      if (typeof contact.note === "string") {
         contact.noteLength = contact.note.length;
       }
       return contact;
     });
 }
 
-function contactRowScriptForPerson(personRef = "p") {
-  return [
-    `set emailValues to {}`,
-    `repeat with e in emails of ${personRef}`,
-    `  set end of emailValues to (my scrub(label of e) & "=" & my scrub(value of e))`,
-    `end repeat`,
-    `set phoneValues to {}`,
-    `repeat with ph in phones of ${personRef}`,
-    `  set end of phoneValues to (my scrub(label of ph) & "=" & my scrub(value of ph))`,
-    `end repeat`,
-    `set emailText to my joinList(emailValues, ${appleString(LIST_SEPARATOR)})`,
-    `set phoneText to my joinList(phoneValues, ${appleString(LIST_SEPARATOR)})`,
-    `set outputRow to ((id of ${personRef} as text) & tab & my scrub(name of ${personRef}) & tab & my scrub(first name of ${personRef}) & tab & my scrub(last name of ${personRef}) & tab & my scrub(organization of ${personRef}) & tab & my scrub(job title of ${personRef}) & tab & emailText & tab & phoneText & tab & my scrub(note of ${personRef}))`,
-  ];
-}
-
-function searchContactsScript(query, limit) {
+function searchContactsScript(query, limit, groups = {}) {
   return [
     ...commonHandlers(),
     `set queryText to ${appleString(query)}`,
@@ -315,7 +618,7 @@ function searchContactsScript(query, limit) {
     "      set contactId to (id of p as text)",
     "      if seenIds does not contain contactId then",
     "        set end of seenIds to contactId",
-    ...contactRowScriptForPerson("p").map((line) => `        ${line}`),
+    ...contactJsonScriptForPerson("p", groups).map((line) => `        ${line}`),
     "        set end of rows to outputRow",
     "        if (count of rows) is greater than or equal to maxResults then return my joinList(rows, linefeed)",
     "      end if",
@@ -338,7 +641,7 @@ async function contactsStatus() {
   const output = await runAppleScript(script);
   const fields = Object.fromEntries(
     output
-      .split(FIELD_SEPARATOR)
+      .split("\t")
       .map((part) => part.split("="))
       .filter((pair) => pair.length === 2),
   );
@@ -356,42 +659,62 @@ async function contactsStatus() {
 async function searchContacts(args) {
   const query = requireString(args, "query");
   const limit = normalizeLimit(numberValue(args, "limit", 10));
-  const includeEmails = boolValue(args, "includeEmails", false);
-  const includePhones = boolValue(args, "includePhones", false);
-  const includeNote = boolValue(args, "includeNote", false);
   const revealValues = boolValue(args, "revealValues", false);
-  const script = searchContactsScript(query, limit);
+  const groups = resolveGroups(args);
+  const script = searchContactsScript(query, limit, groups);
   const output = await runAppleScript(script);
-  const contacts = parseContactRows(output, { includeEmails, includePhones, includeNote, revealValues });
+  const contacts = parseContactRows(output, { revealValues });
   return {
     ok: true,
     query,
     limit,
     count: contacts.length,
-    redacted: (includeEmails || includePhones) && !revealValues,
+    redacted: (groups.emails || groups.phones) && !revealValues,
     contacts,
   };
 }
 
+const SCALAR_STRING_FIELDS = [
+  ["title", "title"],
+  ["firstName", "first name"],
+  ["middleName", "middle name"],
+  ["lastName", "last name"],
+  ["suffix", "suffix"],
+  ["nickname", "nickname"],
+  ["maidenName", "maiden name"],
+  ["phoneticFirstName", "phonetic first name"],
+  ["phoneticMiddleName", "phonetic middle name"],
+  ["phoneticLastName", "phonetic last name"],
+  ["organization", "organization"],
+  ["department", "department"],
+  ["jobTitle", "job title"],
+  ["note", "note"],
+];
+const SCALAR_BOOLEAN_FIELDS = [["isCompany", "company"]];
+const SCALAR_DATE_FIELDS = [["birthday", "birth date"]];
+
 function buildScalarProperties(args) {
-  const properties = {};
-  for (const [argKey, outputKey] of [
-    ["firstName", "first name"],
-    ["lastName", "last name"],
-    ["organization", "organization"],
-    ["jobTitle", "job title"],
-    ["department", "department"],
-    ["nickname", "nickname"],
-    ["note", "note"],
-  ]) {
+  const stringProps = {};
+  for (const [argKey, outputKey] of SCALAR_STRING_FIELDS) {
     const value = optionalString(args, argKey);
-    if (value != null) properties[outputKey] = value;
+    if (value != null) stringProps[outputKey] = value;
   }
-  return properties;
+  const booleanProps = {};
+  for (const [argKey, outputKey] of SCALAR_BOOLEAN_FIELDS) {
+    if (args[argKey] != null) booleanProps[outputKey] = args[argKey] === true;
+  }
+  const dateProps = {};
+  for (const [argKey, outputKey] of SCALAR_DATE_FIELDS) {
+    if (args[argKey] != null) dateProps[outputKey] = normalizeDateParts(args[argKey]);
+  }
+  return { stringProps, booleanProps, dateProps };
 }
 
-function scalarSummary(properties) {
-  return Object.fromEntries(Object.entries(properties).map(([key, value]) => [key, value]));
+function scalarSummary({ stringProps, booleanProps, dateProps }) {
+  const summary = { ...stringProps };
+  for (const [key, value] of Object.entries(booleanProps)) summary[key] = value;
+  for (const [key, value] of Object.entries(dateProps)) summary[key] = formatDatePartsIso(value);
+  return summary;
 }
 
 function localDateString(date = new Date()) {
@@ -431,11 +754,41 @@ function formatContactLogEntry({ date, summary, openThreads }) {
   return `- ${safeDate} - ${safeSummary}\n  Open threads: ${openThreadText}`;
 }
 
-function propertyAssignmentScript(personRef, properties, indent = "") {
-  return Object.entries(properties).map(([key, value]) => {
-    const expression = key === "note" ? appleMultilineString(value) : appleString(value);
-    return `${indent}set ${key} of ${personRef} to ${expression}`;
+function scalarDateVariableLines(dateProps, prefix) {
+  const lines = [];
+  const varNames = {};
+  let i = 0;
+  for (const [outputKey, parts] of Object.entries(dateProps)) {
+    const varName = `${prefix}${i++}`;
+    lines.push(`set ${varName} to my buildDate(${parts.year}, ${parts.month}, ${parts.day})`);
+    varNames[outputKey] = varName;
+  }
+  return { lines, varNames };
+}
+
+function listDateVariableLines(items, prefix) {
+  const lines = [];
+  const varNames = items.map((item, i) => {
+    const varName = `${prefix}${i}`;
+    lines.push(`set ${varName} to my buildDate(${item.year}, ${item.month}, ${item.day})`);
+    return varName;
   });
+  return { lines, varNames };
+}
+
+function propertyAssignmentScript(personRef, { stringProps, booleanProps, dateVarNames }, indent = "") {
+  const lines = [];
+  for (const [key, value] of Object.entries(stringProps)) {
+    const expression = key === "note" ? appleMultilineString(value) : appleString(value);
+    lines.push(`${indent}set ${key} of ${personRef} to ${expression}`);
+  }
+  for (const [key, value] of Object.entries(booleanProps)) {
+    lines.push(`${indent}set ${key} of ${personRef} to ${value ? "true" : "false"}`);
+  }
+  for (const [key, varName] of Object.entries(dateVarNames)) {
+    lines.push(`${indent}set ${key} of ${personRef} to ${varName}`);
+  }
+  return lines;
 }
 
 function propertyLiteral(key, value) {
@@ -443,19 +796,65 @@ function propertyLiteral(key, value) {
   return `${key}:${expression}`;
 }
 
+function addressCreationLines(personRef, addresses, indent = "") {
+  return addresses.map(
+    (a) =>
+      `${indent}make new address at end of addresses of ${personRef} with properties {label:${appleString(a.label)}, street:${appleString(a.street)}, city:${appleString(a.city)}, state:${appleString(a.state)}, zip:${appleString(a.zip)}, country:${appleString(a.country)}, country code:${appleString(a.countryCode)}}`,
+  );
+}
+
+function urlCreationLines(personRef, urls, indent = "") {
+  return urls.map(
+    (u) =>
+      `${indent}make new url at end of urls of ${personRef} with properties {label:${appleString(u.label)}, value:${appleString(u.value)}}`,
+  );
+}
+
+function relatedNameCreationLines(personRef, relatedNames, indent = "") {
+  return relatedNames.map(
+    (r) =>
+      `${indent}make new related name at end of related names of ${personRef} with properties {label:${appleString(r.label)}, value:${appleString(r.value)}}`,
+  );
+}
+
+function socialProfileCreationLines(personRef, profiles, indent = "") {
+  return profiles.map(
+    (s) =>
+      `${indent}make new social profile at end of social profiles of ${personRef} with properties {user name:${appleString(s.userName)}, url:${appleString(s.url)}, service name:${appleString(s.service)}}`,
+  );
+}
+
+function customDateCreationLines(personRef, customDates, dateVarNames, indent = "") {
+  return customDates.map(
+    (c, i) =>
+      `${indent}make new custom date at end of custom dates of ${personRef} with properties {label:${appleString(c.label)}, value:${dateVarNames[i]}}`,
+  );
+}
+
 async function createContact(args) {
   const dryRun = boolValue(args, "dryRun", true);
   const confirm = boolValue(args, "confirm", false);
-  const properties = buildScalarProperties(args);
+  rejectInstantMessages(args.instantMessages);
+  const { stringProps, booleanProps, dateProps } = buildScalarProperties(args);
   const emails = normalizeLabeledValues(args.emails || args.emailAddresses, "emails");
   const phones = normalizeLabeledValues(args.phones || args.phoneNumbers, "phones");
-  if (!properties["first name"] && !properties["last name"] && !properties.organization) {
+  const addresses = normalizeAddresses(args.addresses);
+  const urls = normalizeUrls(args.urls);
+  const relatedNames = normalizeRelatedNames(args.relatedNames);
+  const socialProfiles = normalizeSocialProfiles(args.socialProfiles);
+  const customDates = normalizeCustomDates(args.customDates);
+  if (!stringProps["first name"] && !stringProps["last name"] && !stringProps.organization) {
     throw new Error("create_contact requires firstName, lastName, or organization");
   }
   const proposed = {
-    fields: scalarSummary(properties),
+    fields: scalarSummary({ stringProps, booleanProps, dateProps }),
     emails,
     phones,
+    addresses,
+    urls,
+    relatedNames,
+    socialProfiles,
+    customDates,
   };
   if (dryRun || !confirm) {
     return {
@@ -465,11 +864,20 @@ async function createContact(args) {
       requiredForWrite: { dryRun: false, confirm: true },
     };
   }
-  const propertyParts = Object.entries(properties).map(([key, value]) => propertyLiteral(key, value));
+  const { lines: scalarDateLines, varNames: scalarDateVarNames } = scalarDateVariableLines(dateProps, "scalarDate");
+  const { lines: customDateVarLines, varNames: customDateVarNames } = listDateVariableLines(
+    customDates,
+    "customDateVar",
+  );
+  const propertyParts = Object.entries(stringProps).map(([key, value]) => propertyLiteral(key, value));
   const script = [
     ...commonHandlers(),
+    ...scalarDateLines,
+    ...customDateVarLines,
     "tell application \"Contacts\"",
     `  set p to make new person with properties {${propertyParts.join(", ")}}`,
+    ...Object.entries(booleanProps).map(([key, value]) => `  set ${key} of p to ${value ? "true" : "false"}`),
+    ...Object.entries(scalarDateVarNames).map(([key, varName]) => `  set ${key} of p to ${varName}`),
     ...emails.map(
       (item) =>
         `  make new email at end of emails of p with properties {label:${appleString(item.label)}, value:${appleString(item.value)}}`,
@@ -478,8 +886,13 @@ async function createContact(args) {
       (item) =>
         `  make new phone at end of phones of p with properties {label:${appleString(item.label)}, value:${appleString(item.value)}}`,
     ),
+    ...addressCreationLines("p", addresses, "  "),
+    ...urlCreationLines("p", urls, "  "),
+    ...relatedNameCreationLines("p", relatedNames, "  "),
+    ...socialProfileCreationLines("p", socialProfiles, "  "),
+    ...customDateCreationLines("p", customDates, customDateVarNames, "  "),
     "  save",
-    ...contactRowScriptForPerson("p").map((line) => `  ${line}`),
+    ...contactJsonScriptForPerson("p", ALL_GROUPS).map((line) => `  ${line}`),
     "  return outputRow",
     "end tell",
   ];
@@ -487,11 +900,11 @@ async function createContact(args) {
   return {
     ok: true,
     dryRun: false,
-    created: parseContactRows(output, { includeEmails: true, includePhones: true, revealValues: false })[0],
+    created: parseContactRows(output, { revealValues: false })[0],
   };
 }
 
-async function getContactById(contactId, options = {}) {
+async function getContactById(contactId, groups = ALL_GROUPS) {
   const script = [
     ...commonHandlers(),
     `set contactId to ${appleString(contactId)}`,
@@ -499,12 +912,12 @@ async function getContactById(contactId, options = {}) {
     "  set matches to people whose id is contactId",
     "  if (count of matches) is not 1 then error \"expected exactly one contact for id \" & contactId & \", found \" & (count of matches)",
     "  set p to item 1 of matches",
-    ...contactRowScriptForPerson("p").map((line) => `  ${line}`),
+    ...contactJsonScriptForPerson("p", groups).map((line) => `  ${line}`),
     "  return outputRow",
     "end tell",
   ];
   const output = await runAppleScript(script);
-  return parseContactRows(output, options)[0];
+  return parseContactRows(output, { revealValues: false })[0];
 }
 
 async function updateContact(args) {
@@ -512,25 +925,43 @@ async function updateContact(args) {
   const dryRun = boolValue(args, "dryRun", true);
   const confirm = boolValue(args, "confirm", false);
   const changes = isPlainObject(args.changes) ? args.changes : args;
-  const properties = buildScalarProperties(changes);
+  rejectInstantMessages(changes.addInstantMessages);
+  const { stringProps, booleanProps, dateProps } = buildScalarProperties(changes);
   const addEmails = normalizeLabeledValues(changes.addEmails || changes.emailsToAdd, "emails");
   const addPhones = normalizeLabeledValues(changes.addPhones || changes.phonesToAdd, "phones");
-  if (!Object.keys(properties).length && !addEmails.length && !addPhones.length) {
-    throw new Error("update_contact requires at least one scalar field, note, addEmails, or addPhones");
+  const addAddresses = normalizeAddresses(changes.addAddresses);
+  const addUrls = normalizeUrls(changes.addUrls);
+  const addRelatedNames = normalizeRelatedNames(changes.addRelatedNames);
+  const addSocialProfiles = normalizeSocialProfiles(changes.addSocialProfiles);
+  const addCustomDates = normalizeCustomDates(changes.addCustomDates);
+  const hasScalarChange =
+    Object.keys(stringProps).length || Object.keys(booleanProps).length || Object.keys(dateProps).length;
+  const hasCollectionChange =
+    addEmails.length ||
+    addPhones.length ||
+    addAddresses.length ||
+    addUrls.length ||
+    addRelatedNames.length ||
+    addSocialProfiles.length ||
+    addCustomDates.length;
+  if (!hasScalarChange && !hasCollectionChange) {
+    throw new Error(
+      "update_contact requires at least one scalar field, note, or an addX array of new entries (addEmails, addPhones, addAddresses, addUrls, addRelatedNames, addSocialProfiles, addCustomDates)",
+    );
   }
-  const before = await getContactById(contactId, {
-    includeEmails: true,
-    includePhones: true,
-    includeNote: Object.prototype.hasOwnProperty.call(properties, "note"),
-    revealValues: false,
-  });
+  const before = await getContactById(contactId, ALL_GROUPS);
   const proposed = {
     contactId,
     before,
     changes: {
-      fields: scalarSummary(properties),
+      fields: scalarSummary({ stringProps, booleanProps, dateProps }),
       addEmails,
       addPhones,
+      addAddresses,
+      addUrls,
+      addRelatedNames,
+      addSocialProfiles,
+      addCustomDates,
     },
   };
   if (dryRun || !confirm) {
@@ -541,14 +972,21 @@ async function updateContact(args) {
       requiredForWrite: { dryRun: false, confirm: true },
     };
   }
+  const { lines: scalarDateLines, varNames: scalarDateVarNames } = scalarDateVariableLines(dateProps, "scalarDate");
+  const { lines: customDateVarLines, varNames: customDateVarNames } = listDateVariableLines(
+    addCustomDates,
+    "customDateVar",
+  );
   const script = [
     ...commonHandlers(),
+    ...scalarDateLines,
+    ...customDateVarLines,
     `set contactId to ${appleString(contactId)}`,
     "tell application \"Contacts\"",
     "  set matches to people whose id is contactId",
     "  if (count of matches) is not 1 then error \"expected exactly one contact for id \" & contactId & \", found \" & (count of matches)",
     "  set p to item 1 of matches",
-    ...propertyAssignmentScript("p", properties, "  "),
+    ...propertyAssignmentScript("p", { stringProps, booleanProps, dateVarNames: scalarDateVarNames }, "  "),
     ...addEmails.map(
       (item) =>
         `  make new email at end of emails of p with properties {label:${appleString(item.label)}, value:${appleString(item.value)}}`,
@@ -557,8 +995,13 @@ async function updateContact(args) {
       (item) =>
         `  make new phone at end of phones of p with properties {label:${appleString(item.label)}, value:${appleString(item.value)}}`,
     ),
+    ...addressCreationLines("p", addAddresses, "  "),
+    ...urlCreationLines("p", addUrls, "  "),
+    ...relatedNameCreationLines("p", addRelatedNames, "  "),
+    ...socialProfileCreationLines("p", addSocialProfiles, "  "),
+    ...customDateCreationLines("p", addCustomDates, customDateVarNames, "  "),
     "  save",
-    ...contactRowScriptForPerson("p").map((line) => `  ${line}`),
+    ...contactJsonScriptForPerson("p", ALL_GROUPS).map((line) => `  ${line}`),
     "  return outputRow",
     "end tell",
   ];
@@ -567,12 +1010,7 @@ async function updateContact(args) {
     ok: true,
     dryRun: false,
     before,
-    after: parseContactRows(output, {
-      includeEmails: true,
-      includePhones: true,
-      includeNote: Object.prototype.hasOwnProperty.call(properties, "note"),
-      revealValues: false,
-    })[0],
+    after: parseContactRows(output, { revealValues: false })[0],
   };
 }
 
@@ -585,7 +1023,7 @@ async function appendContactNote(args) {
     summary: args.summary,
     openThreads: args.openThreads,
   });
-  const before = await getContactById(contactId, { includeNote: true });
+  const before = await getContactById(contactId, { note: true });
   const proposed = {
     contactId,
     contact: {
@@ -625,7 +1063,7 @@ async function appendContactNote(args) {
     "    set note of p to existingNote & linefeed & appendedEntry",
     "  end if",
     "  save",
-    ...contactRowScriptForPerson("p").map((line) => `  ${line}`),
+    ...contactJsonScriptForPerson("p", { note: true }).map((line) => `  ${line}`),
     "  return outputRow",
     "end tell",
   ];
@@ -636,7 +1074,7 @@ async function appendContactNote(args) {
     appended: true,
     appendedEntry,
     beforeNoteLength: before.noteLength || 0,
-    after: parseContactRows(output, { includeNote: true })[0],
+    after: parseContactRows(output, { revealValues: false })[0],
   };
 }
 
@@ -645,7 +1083,7 @@ async function deleteContact(args) {
   const dryRun = boolValue(args, "dryRun", true);
   const confirm = boolValue(args, "confirm", false);
   const confirmPhrase = scrubInput(args.confirmPhrase);
-  const before = await getContactById(contactId, { includeEmails: true, includePhones: true, revealValues: false });
+  const before = await getContactById(contactId, ALL_GROUPS);
   if (dryRun || !confirm || confirmPhrase !== "delete contact") {
     return {
       ok: true,
@@ -733,7 +1171,8 @@ function toolDefinitions() {
     {
       name: "search_contacts",
       title: "Search Contacts",
-      description: "Search Apple Contacts by name, organization, job title, email, or phone.",
+      description:
+        "Search Apple Contacts by name, organization, job title, email, or phone. Core fields (name, organization, jobTitle) and all group counts are always returned; optional field groups (emails, phones, note, extendedName, orgDetails, birthday, addresses, urls, relatedNames, socialProfiles, instantMessages, customDates) are only fetched when their includeX flag is set, to keep default searches fast.",
       inputSchema: {
         type: "object",
         properties: {
@@ -742,6 +1181,27 @@ function toolDefinitions() {
           includeEmails: { type: "boolean", default: false },
           includePhones: { type: "boolean", default: false },
           includeNote: { type: "boolean", default: false },
+          includeExtendedName: {
+            type: "boolean",
+            default: false,
+            description: "title, middleName, suffix, nickname, maidenName, phoneticFirstName/MiddleName/LastName.",
+          },
+          includeOrgDetails: { type: "boolean", default: false, description: "department, isCompany." },
+          includeBirthday: { type: "boolean", default: false },
+          includeAddresses: { type: "boolean", default: false },
+          includeUrls: { type: "boolean", default: false },
+          includeRelatedNames: {
+            type: "boolean",
+            default: false,
+            description: "Apple Contacts' 'relatives' field, e.g. spouse, parent, child, sibling.",
+          },
+          includeSocialProfiles: { type: "boolean", default: false },
+          includeInstantMessages: {
+            type: "boolean",
+            default: false,
+            description: "Read-only; instant messages cannot be created or updated (a macOS limitation).",
+          },
+          includeCustomDates: { type: "boolean", default: false },
           revealValues: { type: "boolean", default: false },
         },
         required: ["query"],
@@ -755,15 +1215,45 @@ function toolDefinitions() {
       inputSchema: {
         type: "object",
         properties: {
+          title: { type: "string" },
           firstName: { type: "string" },
+          middleName: { type: "string" },
           lastName: { type: "string" },
-          organization: { type: "string" },
-          jobTitle: { type: "string" },
-          department: { type: "string" },
+          suffix: { type: "string" },
           nickname: { type: "string" },
+          maidenName: { type: "string" },
+          phoneticFirstName: { type: "string" },
+          phoneticMiddleName: { type: "string" },
+          phoneticLastName: { type: "string" },
+          organization: { type: "string" },
+          department: { type: "string" },
+          jobTitle: { type: "string" },
+          isCompany: { type: "boolean" },
+          birthday: { type: "string", description: "YYYY-MM-DD, or --MM-DD for a birthday with no year." },
           note: { type: "string" },
           emails: { type: "array", items: { type: "object" } },
           phones: { type: "array", items: { type: "object" } },
+          addresses: {
+            type: "array",
+            items: { type: "object" },
+            description: "{label, street, city, state, zip, country, countryCode}.",
+          },
+          urls: { type: "array", items: { type: "object" }, description: "{label, value}." },
+          relatedNames: {
+            type: "array",
+            items: { type: "object" },
+            description: "Apple Contacts' 'relatives' field: {label:'spouse'|'parent'|'child'|..., value:'Full Name'}.",
+          },
+          socialProfiles: {
+            type: "array",
+            items: { type: "object" },
+            description: "{service, userName, url}.",
+          },
+          customDates: {
+            type: "array",
+            items: { type: "object" },
+            description: "{label:'Anniversary', value:'YYYY-MM-DD' or '--MM-DD'}.",
+          },
           dryRun: { type: "boolean", default: true },
           confirm: { type: "boolean", default: false },
         },
@@ -773,7 +1263,8 @@ function toolDefinitions() {
     {
       name: "update_contact",
       title: "Update Contact",
-      description: "Update an Apple Contact by contactId. Dry-run by default; actual writes require dryRun=false and confirm=true.",
+      description:
+        "Update an Apple Contact by contactId. changes may set any scalar field (firstName, lastName, title, middleName, suffix, nickname, maidenName, phoneticFirstName/MiddleName/LastName, organization, department, jobTitle, isCompany, birthday, note) and/or append new entries via addEmails, addPhones, addAddresses, addUrls, addRelatedNames, addSocialProfiles, addCustomDates. Instant messages are read-only. Dry-run by default; actual writes require dryRun=false and confirm=true.",
       inputSchema: {
         type: "object",
         properties: {
