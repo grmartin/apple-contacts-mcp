@@ -14,6 +14,10 @@ test("lists the expected MCP tools", () => {
       "create_contact",
       "update_contact",
       "append_contact_note",
+      "list_groups",
+      "create_group",
+      "add_to_group",
+      "remove_from_group",
       "delete_contact",
       "test_roundtrip",
     ],
@@ -131,6 +135,27 @@ test("create_contact dry-run normalizes birthday and related names", async () =>
   assert.equal(result.wouldCreate.fields["birth date"], "--05-17");
   assert.equal(result.wouldCreate.relatedNames[0].label, "spouse");
   assert.equal(result.wouldCreate.relatedNames[0].value, "Ada Lovelace");
+});
+
+test("create_group is dry-run by default", async () => {
+  const result = await server.callTool("create_group", { name: "Book Club" });
+  assert.equal(result.dryRun, true);
+  assert.equal(result.wouldCreate.name, "Book Club");
+});
+
+test("create_group requires a name", async () => {
+  await assert.rejects(() => server.callTool("create_group", {}), /name is required/);
+});
+
+test("list_groups script queries all groups without a filter", () => {
+  const script = server.listGroupsScript(null, 200).join("\n");
+  assert.match(script, /set candidateGroups to groups/);
+  assert.doesNotMatch(script, /groups whose name contains/);
+});
+
+test("list_groups script filters by name when a query is given", () => {
+  const script = server.listGroupsScript("Book Club", 200).join("\n");
+  assert.match(script, /groups whose name contains queryText/);
 });
 
 test("AppleScript timeout errors are explicit", () => {

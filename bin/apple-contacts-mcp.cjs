@@ -7,6 +7,7 @@ const readline = require("node:readline");
 const SERVER_NAME = "apple-contacts-mcp";
 const SERVER_VERSION = "0.3.0";
 const MAX_SEARCH_LIMIT = 25;
+const MAX_GROUP_LIMIT = 200;
 
 const SERVER_INSTRUCTIONS = [
   "This server accesses local macOS Contacts through Contacts.app automation.",
@@ -21,6 +22,8 @@ const SERVER_INSTRUCTIONS = [
   "Local writes may sync to iCloud, Google, Exchange, or other configured Contacts accounts.",
   "search_contacts only fetches optional field groups (addresses, urls, relatedNames, socialProfiles, instantMessages, customDates, extendedName, orgDetails, birthday) when their includeX flag is set, to keep default searches fast.",
   "Instant messages are read-only: Contacts.app AppleScript automation cannot create or edit them (a macOS limitation).",
+  "Groups: list_groups, create_group, add_to_group, and remove_from_group manage Contacts.app groups and membership.",
+  "Smart Groups are rule-based and are not scriptable for membership changes; add_to_group/remove_from_group only work on regular groups.",
 ].join(" ");
 
 function isPlainObject(value) {
@@ -106,6 +109,10 @@ function numberValue(args, key, defaultValue) {
 
 function normalizeLimit(value) {
   return Math.max(1, Math.min(MAX_SEARCH_LIMIT, Math.floor(value || 10)));
+}
+
+function normalizeGroupLimit(value) {
+  return Math.max(1, Math.min(MAX_GROUP_LIMIT, Math.floor(value || MAX_GROUP_LIMIT)));
 }
 
 function normalizeLabel(value, fallback) {
@@ -597,6 +604,15 @@ function parseContactRows(text, { revealValues = false } = {}) {
     });
 }
 
+function parseJsonLines(text) {
+  if (!text) return [];
+  return text
+    .split(/\r?\n/u)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+}
+
 function searchContactsScript(query, limit, groups = {}) {
   return [
     ...commonHandlers(),
@@ -627,6 +643,32 @@ function searchContactsScript(query, limit, groups = {}) {
     "  return my joinList(rows, linefeed)",
     "end tell",
   ];
+}
+
+function groupJsonScriptForGroup(groupRef = "g") {
+  return [
+    `set memberCountVal to (count of people of ${groupRef})`,
+    `set outputRow to my jsonObj({my jsonPair("id", my jsonStr(id of ${groupRef} as text)), my jsonPair("name", my jsonStr(name of ${groupRef})), my jsonPair("memberCount", memberCountVal as text)})`,
+  ];
+}
+
+function listGroupsScript(query, limit) {
+  const lines = [...commonHandlers(), `set maxResults to ${limit}`, 'tell application "Contacts"', "  set rows to {}"];
+  if (query) {
+    lines.push(`  set queryText to ${appleString(query)}`, "  set candidateGroups to (groups whose name contains queryText)");
+  } else {
+    lines.push("  set candidateGroups to groups");
+  }
+  lines.push(
+    "  repeat with g in candidateGroups",
+    ...groupJsonScriptForGroup("g").map((line) => `    ${line}`),
+    "    set end of rows to outputRow",
+    "    if (count of rows) is greater than or equal to maxResults then return my joinList(rows, linefeed)",
+    "  end repeat",
+    "  return my joinList(rows, linefeed)",
+    "end tell",
+  );
+  return lines;
 }
 
 async function contactsStatus() {
@@ -672,6 +714,124 @@ async function searchContacts(args) {
     redacted: (groups.emails || groups.phones) && !revealValues,
     contacts,
   };
+}
+
+async function listGroups(args) {
+  const query = optionalString(args, "query", 200);
+  const limit = normalizeGroupLimit(numberValue(args, "limit", MAX_GROUP_LIMIT));
+  const script = listGroupsScript(query, limit);
+  const output = await runAppleScript(script);
+  const groups = parseJsonLines(output);
+  return { ok: true, query: query || null, limit, count: groups.length, groups };
+}
+
+async function getGroupById(groupId) {
+  const script = [
+    ...commonHandlers(),
+    `set groupId to ${appleString(groupId)}`,
+    'tell application "Contacts"',
+    "  set matches to groups whose id is groupId",
+    '  if (count of matches) is not 1 then error "expected exactly one group for id " & groupId & ", found " & (count of matches)',
+    "  set g to item 1 of matches",
+    ...groupJsonScriptForGroup("g").map((line) => `  ${line}`),
+    "  return outputRow",
+    "end tell",
+  ];
+  const output = await runAppleScript(script);
+  return JSON.parse(output);
+}
+
+async function createGroup(args) {
+  const name = requireString(args, "name");
+  const dryRun = boolValue(args, "dryRun", true);
+  const confirm = boolValue(args, "confirm", false);
+  const proposed = { name };
+  if (dryRun || !confirm) {
+    return {
+      ok: true,
+      dryRun: true,
+      wouldCreate: proposed,
+      requiredForWrite: { dryRun: false, confirm: true },
+    };
+  }
+  const script = [
+    ...commonHandlers(),
+    `set groupName to ${appleString(name)}`,
+    'tell application "Contacts"',
+    "  set g to make new group with properties {name:groupName}",
+    "  save",
+    ...groupJsonScriptForGroup("g").map((line) => `  ${line}`),
+    "  return outputRow",
+    "end tell",
+  ];
+  const output = await runAppleScript(script);
+  return { ok: true, dryRun: false, created: JSON.parse(output) };
+}
+
+async function addToGroup(args) {
+  const contactId = requireString(args, "contactId");
+  const groupId = requireString(args, "groupId");
+  const dryRun = boolValue(args, "dryRun", true);
+  const confirm = boolValue(args, "confirm", false);
+  const [contact, group] = await Promise.all([getContactById(contactId, {}), getGroupById(groupId)]);
+  const proposed = { contact: { id: contact.id, name: contact.name }, group };
+  if (dryRun || !confirm) {
+    return {
+      ok: true,
+      dryRun: true,
+      proposed,
+      requiredForWrite: { dryRun: false, confirm: true },
+    };
+  }
+  const script = [
+    `set contactId to ${appleString(contactId)}`,
+    `set groupId to ${appleString(groupId)}`,
+    'tell application "Contacts"',
+    "  set personMatches to people whose id is contactId",
+    '  if (count of personMatches) is not 1 then error "expected exactly one contact for id " & contactId & ", found " & (count of personMatches)',
+    "  set groupMatches to groups whose id is groupId",
+    '  if (count of groupMatches) is not 1 then error "expected exactly one group for id " & groupId & ", found " & (count of groupMatches)',
+    "  set p to item 1 of personMatches",
+    "  set g to item 1 of groupMatches",
+    "  add p to g",
+    "  save",
+    "end tell",
+  ];
+  await runAppleScript(script);
+  return { ok: true, dryRun: false, added: true, contact: proposed.contact, group };
+}
+
+async function removeFromGroup(args) {
+  const contactId = requireString(args, "contactId");
+  const groupId = requireString(args, "groupId");
+  const dryRun = boolValue(args, "dryRun", true);
+  const confirm = boolValue(args, "confirm", false);
+  const [contact, group] = await Promise.all([getContactById(contactId, {}), getGroupById(groupId)]);
+  const proposed = { contact: { id: contact.id, name: contact.name }, group };
+  if (dryRun || !confirm) {
+    return {
+      ok: true,
+      dryRun: true,
+      proposed,
+      requiredForWrite: { dryRun: false, confirm: true },
+    };
+  }
+  const script = [
+    `set contactId to ${appleString(contactId)}`,
+    `set groupId to ${appleString(groupId)}`,
+    'tell application "Contacts"',
+    "  set personMatches to people whose id is contactId",
+    '  if (count of personMatches) is not 1 then error "expected exactly one contact for id " & contactId & ", found " & (count of personMatches)',
+    "  set groupMatches to groups whose id is groupId",
+    '  if (count of groupMatches) is not 1 then error "expected exactly one group for id " & groupId & ", found " & (count of groupMatches)',
+    "  set p to item 1 of personMatches",
+    "  set g to item 1 of groupMatches",
+    "  remove p from g",
+    "  save",
+    "end tell",
+  ];
+  await runAppleScript(script);
+  return { ok: true, dryRun: false, removed: true, contact: proposed.contact, group };
 }
 
 const SCALAR_STRING_FIELDS = [
@@ -1296,6 +1456,69 @@ function toolDefinitions() {
       },
     },
     {
+      name: "list_groups",
+      title: "List Contact Groups",
+      description:
+        "List Contacts.app groups by id, name, and member count. Optional query filters by name substring. Smart Groups (rule-based) may not support membership changes via add_to_group/remove_from_group.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          query: { type: "string" },
+          limit: { type: "number", minimum: 1, maximum: MAX_GROUP_LIMIT },
+        },
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "create_group",
+      title: "Create Contact Group",
+      description: "Create a new Contacts.app group. Dry-run by default; actual writes require dryRun=false and confirm=true.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          name: { type: "string" },
+          dryRun: { type: "boolean", default: true },
+          confirm: { type: "boolean", default: false },
+        },
+        required: ["name"],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "add_to_group",
+      title: "Add Contact To Group",
+      description:
+        "Add a contact to a Contacts.app group by contactId and groupId. Only works on regular groups; Smart Groups are rule-based and not scriptable for membership. Dry-run by default; actual writes require dryRun=false and confirm=true.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          contactId: { type: "string" },
+          groupId: { type: "string" },
+          dryRun: { type: "boolean", default: true },
+          confirm: { type: "boolean", default: false },
+        },
+        required: ["contactId", "groupId"],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "remove_from_group",
+      title: "Remove Contact From Group",
+      description:
+        "Remove a contact from a Contacts.app group by contactId and groupId. Only works on regular groups; Smart Groups are rule-based and not scriptable for membership. Dry-run by default; actual writes require dryRun=false and confirm=true.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          contactId: { type: "string" },
+          groupId: { type: "string" },
+          dryRun: { type: "boolean", default: true },
+          confirm: { type: "boolean", default: false },
+        },
+        required: ["contactId", "groupId"],
+        additionalProperties: false,
+      },
+    },
+    {
       name: "delete_contact",
       title: "Delete Contact",
       description: "Delete an Apple Contact by contactId. Dry-run by default and requires confirmPhrase='delete contact'.",
@@ -1333,6 +1556,10 @@ async function callTool(name, args) {
   if (name === "create_contact") return createContact(args);
   if (name === "update_contact") return updateContact(args);
   if (name === "append_contact_note") return appendContactNote(args);
+  if (name === "list_groups") return listGroups(args);
+  if (name === "create_group") return createGroup(args);
+  if (name === "add_to_group") return addToGroup(args);
+  if (name === "remove_from_group") return removeFromGroup(args);
   if (name === "delete_contact") return deleteContact(args);
   if (name === "test_roundtrip") return testRoundtrip(args);
   throw new Error(`unknown Apple Contacts MCP tool: ${name}`);
@@ -1422,6 +1649,7 @@ module.exports = {
   handleRpc,
   parseContactRows,
   searchContactsScript,
+  listGroupsScript,
   appleScriptErrorDetail,
   maskEmail,
   maskPhone,

@@ -11,6 +11,9 @@ The server uses `Contacts.app` automation through AppleScript today. That keeps 
 - `create_contact`: create a contact, including name/title/phonetic fields, organization, birthday, note, emails, phones, addresses, urls, related names ("relatives"), social profiles, and custom dates. Dry-run by default.
 - `update_contact`: update any scalar field or append new emails, phones, addresses, urls, related names, social profiles, or custom dates. Dry-run by default.
 - `append_contact_note`: append a dated interaction log entry to a contact note. Dry-run by default.
+- `list_groups`: list Contacts.app groups by id, name, and member count. Optional `query` filters by name substring.
+- `create_group`: create a new group. Dry-run by default.
+- `add_to_group` / `remove_from_group`: add or remove a contact from a group by `contactId` and `groupId`. Dry-run by default.
 - `delete_contact`: delete a contact. Dry-run by default and requires a confirmation phrase.
 - `test_roundtrip`: create, edit, verify, and delete one dummy contact.
 
@@ -31,6 +34,10 @@ Two exclusions:
 
 - **Photos** are not read or written. Even checking whether a contact *has* a photo via AppleScript (`image of person`) forces Contacts.app to transfer the full image over Apple Events — roughly 1-2 seconds per contact — so it's left out entirely to keep searches fast.
 - **Instant messages** are read-only. `search_contacts` can return them, but `make new instant message` reliably fails under Contacts.app AppleScript automation on current macOS (a platform limitation, not a bug in this server), so `create_contact`/`update_contact` reject any instant-message input with a clear error.
+
+## Groups
+
+`list_groups`, `create_group`, `add_to_group`, and `remove_from_group` manage Contacts.app groups and membership. Smart Groups (rule-based, built from search criteria) are not scriptable for membership changes — `add_to_group`/`remove_from_group` only work on regular groups. There is no `delete_group` tool yet; delete a group directly in Contacts.app if needed.
 
 ## Requirements
 

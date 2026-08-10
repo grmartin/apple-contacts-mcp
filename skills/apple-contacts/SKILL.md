@@ -19,6 +19,8 @@ Safety rules:
 - `search_contacts` only fetches optional field groups (addresses, urls, relatedNames, socialProfiles, instantMessages, customDates, extendedName, orgDetails, birthday) when their `includeX` flag is set — pass only the flags you need to keep searches fast.
 - "Relatives" live in the `relatedNames` field (label like spouse/parent/child plus a name); use `includeRelatedNames` to read them and `relatedNames`/`addRelatedNames` to write them.
 - Instant messages are read-only (a Contacts.app AppleScript limitation) — `create_contact`/`update_contact` will reject instant-message input.
+- Use `list_groups` to find a group's `groupId` before `add_to_group`/`remove_from_group`. Smart Groups (rule-based) can't have membership changed this way — only regular groups.
+- There is no `delete_group` tool; groups are deleted directly in Contacts.app, not through this MCP.
 - Mention that edits may sync to iCloud, Google, Exchange, or any configured Contacts account.
 - Never edit the SQLite AddressBook database directly.
 
